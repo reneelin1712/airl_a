@@ -12,7 +12,7 @@ class RoadWorld(object):
     """
 
     def __init__(self, network_path, edge_path, pre_reset=None, origins=None,
-                 destinations=None, k=3):
+                 destinations=None, k=8):
         self.network_path = network_path
         self.netin = origins
         self.netout = destinations

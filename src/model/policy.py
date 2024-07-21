@@ -21,13 +21,12 @@ class PolicyCNN(nn.Module):
         
         self.path_feature = torch.from_numpy(path_feature).float()
         self.link_feature = torch.from_numpy(link_feature).float()
-        # change self.new_index = torch.tensor([7, 0, 1, 6, 8, 2, 5, 4, 3]).long()
-        self.new_index = torch.tensor([0, 1, 2, 3]).long()
+        self.new_index = torch.tensor([7, 0, 1, 6, 8, 2, 5, 4, 3]).long()
+      
         self.pad_idx = pad_idx
         self.action_num = action_num
 
-        # change self.conv1 = nn.Conv2d(input_dim, 20, 3, padding=1)  # [batch, 20, 3, 3]
-        self.conv1 = nn.Conv2d(input_dim, 20, 2, padding=1)  # [batch, 20, 3, 3]
+        self.conv1 = nn.Conv2d(input_dim, 20, 3, padding=1)  # [batch, 20, 3, 3]
         self.pool = nn.MaxPool2d(2, 1)  # [batch, 20, 3, 3]
         self.conv2 = nn.Conv2d(20, 30, 2)  # [batch, 30, 1, 1]
         self.fc1 = nn.Linear(30, 120)  # [batch, 120]
@@ -35,7 +34,7 @@ class PolicyCNN(nn.Module):
         self.fc3 = nn.Linear(84, action_num)  # [batch, 8]
 
         # Increase the input dimension by 1 to account for the weather feature
-        self.conv1 = nn.Conv2d(input_dim + 1, 20, 2, padding=1)
+        self.conv1 = nn.Conv2d(input_dim + 1, 20, 3, padding=1)
 
     def to_device(self, device):
         self.policy_mask = self.policy_mask.to(device)
@@ -73,8 +72,8 @@ class PolicyCNN(nn.Module):
         # neigh_feature = torch.cat([neigh_path_feature, neigh_edge_feature, neigh_mask_feature], -1)
         neigh_feature = neigh_feature[:, self.new_index, :]
         # print('neigh_feature',neigh_feature)
-        # change x = neigh_feature.view(state.size(0), 3, 3, -1)
-        x = neigh_feature.view(state.size(0), 2, 2, -1)
+        x = neigh_feature.view(state.size(0), 3, 3, -1)
+       
         x = x.permute(0, 3, 1, 2)
         return x
 
