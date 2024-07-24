@@ -171,20 +171,27 @@ class DiscriminatorAIRLCNN(nn.Module):
         return neigh_path_feature, neigh_edge_feature, current_path_feature, current_edge_feature, next_path_feature, next_edge_feature
     
 
-    def forward_with_actual_features(self, neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, action,log_prob,next_path_feature, next_edge_feature):
-        # print('inputs', path_feature)
-        # print('inputs', edge_feature)
-        # print('shit',shit)
+    def forward_with_actual_features(self, neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, action, log_prob, next_path_feature, next_edge_feature, time_step):
         # Calculate the neigh_mask_feature
         neigh_mask_feature = self.policy_mask_pad[self.cur_state].unsqueeze(-1)  # [batch_size, 9, 1]
 
+        # Get speed features for the current state
+        speed_features = []
+        for i in range(self.cur_state.size(0)):
+            speed = self.speed_data.get((self.cur_state[i].item(), time_step[i].item()), 0)  # Default to 0 if not found
+            speed_features.append(speed)
+        speed_feature = torch.tensor(speed_features, dtype=torch.float32, device=self.cur_state.device).unsqueeze(-1)
+
+        # Ensure all features have the correct shape
+        speed_feature = speed_feature.view(1, 1, -1)  # [1, 1, feature_size]
+        path_feature = path_feature.unsqueeze(0) if path_feature.dim() == 1 else path_feature  # [1, feature_size]
+        edge_feature = edge_feature.unsqueeze(0) if edge_feature.dim() == 1 else edge_feature  # [1, feature_size]
+
         # Process the neighborhood features
-        # print('neigh_path_feature',neigh_path_feature)
-        # print('neigh_edge_feature',neigh_edge_feature)
-        # print('neigh_mask_feature',neigh_mask_feature)
-        neigh_feature = torch.cat([neigh_path_feature, neigh_edge_feature, neigh_mask_feature], -1)
+        speed_feature_expanded = speed_feature.expand(-1, neigh_path_feature.size(1), -1)
+        neigh_feature = torch.cat([speed_feature_expanded, neigh_path_feature, neigh_edge_feature, neigh_mask_feature], -1)
         neigh_feature = neigh_feature[:, self.new_index, :]
-        x = neigh_feature.view(neigh_path_feature.size(0), 2, 2, -1)
+        x = neigh_feature.view(neigh_path_feature.size(0), 3, 3, -1)
         x = x.permute(0, 3, 1, 2)
 
         # Pass through the convolutional layers
@@ -202,13 +209,25 @@ class DiscriminatorAIRLCNN(nn.Module):
         rs = self.fc3(x)
 
         # Process the current state features
-        x_state = torch.cat([path_feature, edge_feature], -1)
+        x_state = torch.cat([speed_feature.squeeze(1), path_feature, edge_feature], -1)
         x_state = F.leaky_relu(self.h_fc1(x_state), 0.2)
         x_state = F.leaky_relu(self.h_fc2(x_state), 0.2)
         x_state = self.h_fc3(x_state)
 
+        # Get speed features for the next state
+        next_speed_features = []
+        for i in range(self.cur_state.size(0)):
+            next_speed = self.speed_data.get((self.cur_state[i].item(), time_step[i].item()), 0)  # Default to 0 if not found
+            next_speed_features.append(next_speed)
+        next_speed_feature = torch.tensor(next_speed_features, dtype=torch.float32, device=self.cur_state.device).unsqueeze(-1)
+
+        # Ensure next state features have the correct shape
+        next_speed_feature = next_speed_feature.view(1, 1, -1)  # [1, 1, feature_size]
+        next_path_feature = next_path_feature.unsqueeze(0) if next_path_feature.dim() == 1 else next_path_feature  # [1, feature_size]
+        next_edge_feature = next_edge_feature.unsqueeze(0) if next_edge_feature.dim() == 1 else next_edge_feature  # [1, feature_size]
+
         # Process the next state features
-        next_x_state = torch.cat([next_path_feature, next_edge_feature], -1)
+        next_x_state = torch.cat([next_speed_feature.squeeze(1), next_path_feature, next_edge_feature], -1)
         next_x_state = F.leaky_relu(self.h_fc1(next_x_state), 0.2)
         next_x_state = F.leaky_relu(self.h_fc2(next_x_state), 0.2)
         next_x_state = self.h_fc3(next_x_state)

@@ -203,71 +203,72 @@ def evaluate_model(target_od, target_traj, model, env, n_link=424):
         curr_state = next_state
     learner_traj.append(sample_path)
     # for ori, des in zip(target_o[1:], target_d[1:]):
-    for ori, des, time_step in zip(target_o[1:], target_d[1:], target_time_steps[1:]):
-        # if des == curr_des:
-        #     if ori == curr_ori:
-        #         learner_traj.append(sample_path)
-        #         continue
-        #     else:
-        #         curr_ori = ori
-        # else:
-        #     curr_ori, curr_des = ori, des
-        #     des_ts = (torch.ones_like(state_ts) * curr_des).to(device)
-        #     action_prob = model.get_action_prob(state_ts, des_ts).detach().cpu().numpy()  # 714, 8
-        #     state_action = env.state_action[:-1]
-        #     action_prob[state_action == env.pad_idx] = 0.0
-        #     transit_prob = np.zeros((n_link, n_link))
-        #     from_st, ac = np.where(state_action != env.pad_idx)
-        #     to_st = state_action[state_action != env.pad_idx]
-        #     transit_prob[from_st, to_st] = action_prob[from_st, ac]
-        if des == curr_des and ori == curr_ori and time_step == curr_time_step:
-            learner_traj.append(sample_path)
-            continue
-        else:
-            curr_ori, curr_des, curr_time_step = ori, des, time_step
-            des_ts = (torch.ones_like(state_ts) * curr_des).to(device)
-            time_step_ts = (torch.ones_like(state_ts) * curr_time_step).to(device)
-            action_prob = model.get_action_prob(state_ts, des_ts, time_step_ts).detach().cpu().numpy()  # 714, 8
-            state_action = env.state_action[:-1]
-            action_prob[state_action == env.pad_idx] = 0.0
-            transit_prob = np.zeros((n_link, n_link))
-            from_st, ac = np.where(state_action != env.pad_idx)
-            to_st = state_action[state_action != env.pad_idx]
-            transit_prob[from_st, to_st] = action_prob[from_st, ac]
-        sample_path = [str(curr_ori)]
-        curr_state = curr_ori
-        for _ in range(50):
-            if curr_state == curr_des: break
-            next_state = np.argmax(transit_prob[curr_state])
-            sample_path.append(str(next_state))
-            curr_state = next_state
-        learner_traj.append(sample_path)
+    
+    trajectory_data = []
+    # for ori, des, time_step in zip(target_o[1:], target_d[1:], target_time_steps[1:]):
+    #     if des == curr_des and ori == curr_ori and time_step == curr_time_step:
+    #         learner_traj.append(sample_path)
+    #         continue
+    #     else:
+    #         curr_ori, curr_des, curr_time_step = ori, des, time_step
+    #         des_ts = (torch.ones_like(state_ts) * curr_des).to(device)
+    #         time_step_ts = (torch.ones_like(state_ts) * curr_time_step).to(device)
+    #         action_prob = model.get_action_prob(state_ts, des_ts, time_step_ts).detach().cpu().numpy()  # 714, 8
+    #         state_action = env.state_action[:-1]
+    #         action_prob[state_action == env.pad_idx] = 0.0
+    #         transit_prob = np.zeros((n_link, n_link))
+    #         from_st, ac = np.where(state_action != env.pad_idx)
+    #         to_st = state_action[state_action != env.pad_idx]
+    #         transit_prob[from_st, to_st] = action_prob[from_st, ac]
+    #     sample_path = [str(curr_ori)]
+    #     curr_state = curr_ori
+    #     for _ in range(50):
+    #         if curr_state == curr_des: break
+    #         next_state = np.argmax(transit_prob[curr_state])
+    #         sample_path.append(str(next_state))
+    #         curr_state = next_state
+    #     learner_traj.append(sample_path)
+    # evaluate_metrics(target_traj, learner_traj)
+
+    for i, (ori, des, time_step) in enumerate(zip(target_o, target_d, target_time_steps)):
+        if i > 0:  # Skip the first iteration as it's already handled
+            if des == curr_des and ori == curr_ori and time_step == curr_time_step:
+                learner_path = sample_path
+            else:
+                curr_ori, curr_des, curr_time_step = ori, des, time_step
+                des_ts = (torch.ones_like(state_ts) * curr_des).to(device)
+                time_step_ts = (torch.ones_like(state_ts) * curr_time_step).to(device)
+                action_prob = model.get_action_prob(state_ts, des_ts, time_step_ts).detach().cpu().numpy()  # 714, 8
+                state_action = env.state_action[:-1]
+                action_prob[state_action == env.pad_idx] = 0.0
+                transit_prob = np.zeros((n_link, n_link))
+                from_st, ac = np.where(state_action != env.pad_idx)
+                to_st = state_action[state_action != env.pad_idx]
+                transit_prob[from_st, to_st] = action_prob[from_st, ac]
+                
+                sample_path = [str(curr_ori)]
+                curr_state = curr_ori
+                for _ in range(50):
+                    if curr_state == curr_des: break
+                    next_state = np.argmax(transit_prob[curr_state])
+                    sample_path.append(str(next_state))
+                    curr_state = next_state
+                learner_path = sample_path
+            
+            learner_traj.append(learner_path)
+        
+        # Save data for this OD pair (including the first one)
+        target_path = target_traj[i]
+        target_path_str = '_'.join(map(str, target_path))
+        learner_path_str = '_'.join(map(str, learner_traj[i]))
+        trajectory_data.append([target_path_str, str(time_step), learner_path_str, str(time_step)])
+    
+    # Save trajectory data to CSV
+    with open('trajectory_with_timestep.csv', 'w', newline='') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        csv_writer.writerow(['Test Trajectory', 'Test Trajectory Timestep', 'Learner Trajectory', 'Learner Trajectory Timestep'])
+        csv_writer.writerows(trajectory_data)
+    
     evaluate_metrics(target_traj, learner_traj)
 
     return learner_traj  # Return the generated trajectories
-
-
-# def save_learner_trajectories(learner_trajs, env):
-#     # Create a list to store the trajectory data
-#     trajectory_data = []
-
-#     for episode_idx, episode_traj in enumerate(learner_trajs):
-#         curr_state = int(episode_traj[0])
-#         for step_idx, next_state_str in enumerate(episode_traj[1:], start=1):
-#             next_state = int(next_state_str)
-#             action = np.where(env.state_action[curr_state] == next_state)[0][0]
-
-#             # Append the trajectory data to the list
-#             trajectory_data.append({
-#                 'episode': episode_idx,
-#                 'step': step_idx,
-#                 'learner_trajectory': '_'.join(episode_traj[:step_idx+1]),
-#                 'action': action
-#             })
-
-#             curr_state = next_state
-
-#     # Save the trajectory data to a CSV file
-#     trajectory_df = pd.DataFrame(trajectory_data)
-#     trajectory_df.to_csv('learner_trajectories.csv', index=False)
-

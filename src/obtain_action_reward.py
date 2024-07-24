@@ -41,15 +41,10 @@ edge_p = "../data/edge.txt"
 network_p = "../data/transit.npy"
 path_feature_p = "../data/feature_od.npy"
 train_p = "../data/cross_validation/train_CV%d_size%d.csv" % (cv, size)
-# test_p = "../data/cross_validation/test_CV%d.csv" % cv
-test_p = "../data/shortest/shortest_paths_test.csv"
+test_p = "../data/cross_validation/test_CV%d.csv" % cv
 # test_p = "../data/cross_validation/train_CV%d_size%d.csv" % (cv, size)
 model_p = "../trained_models/airl_CV%d_size%d.pt" % (cv, size)
 
-# train_p = "../data/shortest/shortest_paths.csv"
-# test_p = "../data/shortest/shortest_paths_test.csv"
-# # test_p = "../data/cross_validation/train_CV%d_size%d.csv" % (cv, size)
-# model_p = "../trained_models/shortest/shortest.pt"
 
 """initialize road environment"""
 od_list, od_dist = ini_od_dist(train_p)
@@ -65,17 +60,20 @@ edge_feature_pad = np.zeros((env.n_states, edge_feature.shape[1]))
 edge_feature_pad[:edge_feature.shape[0], :] = edge_feature
 
 """define actor and critic"""
+edge_data = pd.read_csv('../data/updated_edges.txt')
+speed_data = {(row['n_id'], row['time_step']): row['speed'] for _, row in edge_data.iterrows()}
+
 policy_net = PolicyCNN(env.n_actions, env.policy_mask, env.state_action,
-                       path_feature_pad, edge_feature_pad,
-                       path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
-                       env.pad_idx).to(device)
+                        path_feature_pad, edge_feature_pad,
+                        path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
+                        env.pad_idx,speed_data).to(device)
 value_net = ValueCNN(path_feature_pad, edge_feature_pad,
-                     path_feature_pad.shape[-1] + edge_feature_pad.shape[-1]).to(device)
+                        path_feature_pad.shape[-1] + edge_feature_pad.shape[-1],speed_data=speed_data).to(device)
 discrim_net = DiscriminatorAIRLCNN(env.n_actions, gamma, env.policy_mask,
-                                   env.state_action, path_feature_pad, edge_feature_pad,
-                                   path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
-                                   path_feature_pad.shape[-1] + edge_feature_pad.shape[-1],
-                                   env.pad_idx).to(device)
+                                    env.state_action, path_feature_pad, edge_feature_pad,
+                                    path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
+                                    path_feature_pad.shape[-1] + edge_feature_pad.shape[-1],
+                                    env.pad_idx,speed_data).to(device)
 
 # Read the transit data from the CSV file
 transit_data = pd.read_csv('../data/transit.csv')
@@ -87,33 +85,40 @@ for _, row in transit_data.iterrows():
 
 # Read the trajectory data from the CSV file
 trajectory_data = []
-with open('trajectories.csv', 'r') as csvfile:
+with open('trajectory_with_timestep.csv', 'r') as csvfile:
     csv_reader = csv.reader(csvfile)
     next(csv_reader)  # Skip the header row
     for row in csv_reader:
         trajectory_data.append(row)
 
-def evaluate_rewards(traj, policy_net, discrim_net, env, transit_dict):
+def evaluate_rewards(traj_data, time_steps, policy_net, discrim_net, env, transit_dict):
     device = torch.device('cpu')  # Use CPU device
-    policy_net.to(device)  # Move policy_net to CPU
-    discrim_net.to(device)  # Move discrim_net to CPU
+    policy_net.to(device)
+    discrim_net.to(device)
     
     reward_data = []
     
-    for episode in traj:
-        des = torch.LongTensor([int(episode[-1])]).long().to(device)
+    for traj, time_step in zip(traj_data, time_steps):
+        path = traj.split('_')
+        time_step = int(time_step)
+        
+        des = torch.LongTensor([int(path[-1])]).long().to(device)
         
         step_rewards = []
-        for step_idx in range(len(episode) - 1):
-            state = torch.LongTensor([int(episode[step_idx])]).to(device)
-            next_state = torch.LongTensor([int(episode[step_idx + 1])]).to(device)
-            action = transit_dict.get((int(episode[step_idx]), int(episode[step_idx + 1])), 'N/A')
+        for step_idx in range(len(path) - 1):
+            state = torch.LongTensor([int(path[step_idx])]).to(device)
+            next_state = torch.LongTensor([int(path[step_idx + 1])]).to(device)
+            time_step_tensor = torch.LongTensor([time_step]).to(device)
+            
+            action = transit_dict.get((int(path[step_idx]), int(path[step_idx + 1])), 'N/A')
             action_tensor = torch.LongTensor([action]).to(device) if action != 'N/A' else None
             
             if action_tensor is not None:
                 with torch.no_grad():
-                    log_prob = policy_net.get_log_prob(state, des, action_tensor).squeeze()
-                    reward = discrim_net.calculate_reward(state, des, action_tensor, log_prob, next_state).item()
+                    print('time_step_tensor',time_step_tensor)
+                    print('action_tensor',action_tensor)
+                    log_prob = policy_net.get_log_prob(state, des, action_tensor, time_step_tensor).squeeze()
+                    reward = discrim_net.calculate_reward(state, des, action_tensor, log_prob, next_state,time_step_tensor).item()
             else:
                 reward = 'N/A'
             
@@ -123,16 +128,19 @@ def evaluate_rewards(traj, policy_net, discrim_net, env, transit_dict):
     
     return reward_data
 
-# Calculate rewards for test and learner trajectories
-test_traj = [test_traj.split('_') for test_traj, _ in trajectory_data]
-learner_traj = [learner_traj.split('_') for _, learner_traj in trajectory_data]
+# Extract test and learner trajectories and their timesteps
+test_traj = [row[0] for row in trajectory_data]
+test_time_steps = [row[1] for row in trajectory_data]
+learner_traj = [row[2] for row in trajectory_data]
+learner_time_steps = [row[3] for row in trajectory_data]
 
-test_reward_data = evaluate_rewards(test_traj, policy_net, discrim_net, env, transit_dict)
-learner_reward_data = evaluate_rewards(learner_traj, policy_net, discrim_net, env, transit_dict)
+# Calculate rewards for test and learner trajectories
+test_reward_data = evaluate_rewards(test_traj, test_time_steps, policy_net, discrim_net, env, transit_dict)
+learner_reward_data = evaluate_rewards(learner_traj, learner_time_steps, policy_net, discrim_net, env, transit_dict)
 
 # Merge reward data with trajectory data
 updated_trajectory_data = []
-for (test_traj, learner_traj), test_reward, learner_reward in zip(trajectory_data, test_reward_data, learner_reward_data):
+for (test_traj, test_time_step, learner_traj, learner_time_step), test_reward, learner_reward in zip(trajectory_data, test_reward_data, learner_reward_data):
     test_links = test_traj.split('_')
     learner_links = learner_traj.split('_')
     
@@ -155,7 +163,7 @@ for (test_traj, learner_traj), test_reward, learner_reward in zip(trajectory_dat
     learner_return = sum(float(r) for r in learner_reward.split('_') if r != 'N/A')
     
     updated_trajectory_data.append([
-        test_traj, learner_traj,
+        test_traj, test_time_step, learner_traj, learner_time_step,
         '_'.join(test_actions), '_'.join(learner_actions),
         test_reward, learner_reward,
         test_return, learner_return
@@ -164,6 +172,7 @@ for (test_traj, learner_traj), test_reward, learner_reward in zip(trajectory_dat
 # Save the updated trajectory data with actions, rewards, and returns to a new CSV file
 with open('trajectories_with_actions_rewards_returns.csv', 'w', newline='') as csvfile:
     csv_writer = csv.writer(csvfile)
-    csv_writer.writerow(['Test Trajectory', 'Learner Trajectory', 'Test Actions', 'Learner Actions',
-                         'Test Rewards', 'Learner Rewards', 'Test Return', 'Learner Return'])
+    csv_writer.writerow(['Test Trajectory', 'Test Trajectory Timestep', 'Learner Trajectory', 'Learner Trajectory Timestep',
+                         'Test Actions', 'Learner Actions', 'Test Rewards', 'Learner Rewards',
+                         'Test Return', 'Learner Return'])
     csv_writer.writerows(updated_trajectory_data)

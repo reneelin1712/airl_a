@@ -113,6 +113,7 @@ class PolicyCNN(nn.Module):
 
     def get_log_prob(self, state, des, actions, time_step):
         action_prob = self.get_action_prob(state, des, time_step)
+        print('action_prob',action_prob)
         return torch.log(action_prob.gather(1, actions.long().unsqueeze(1)))
 
     def get_fim(self, state, des, time_step):

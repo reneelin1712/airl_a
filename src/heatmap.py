@@ -15,6 +15,7 @@ import pandas as pd
 from model.policy import PolicyCNN
 from model.value import ValueCNN
 from model.discriminator import DiscriminatorAIRLCNN
+import csv
 
 import shap
 
@@ -57,19 +58,22 @@ edge_feature_pad = np.zeros((env.n_states, edge_feature.shape[1]))
 edge_feature_pad[:edge_feature.shape[0], :] = edge_feature
 
 """define actor and critic"""
+edge_data = pd.read_csv('../data/updated_edges.txt')
+speed_data = {(row['n_id'], row['time_step']): row['speed'] for _, row in edge_data.iterrows()}
+
 policy_net = PolicyCNN(env.n_actions, env.policy_mask, env.state_action,
                     path_feature_pad, edge_feature_pad,
                     path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
-                    env.pad_idx).to(device)
+                    env.pad_idx, speed_data).to(device)
 value_net = ValueCNN(path_feature_pad, edge_feature_pad,
-                    path_feature_pad.shape[-1] + edge_feature_pad.shape[-1]).to(device)
+                    path_feature_pad.shape[-1] + edge_feature_pad.shape[-1], speed_data=speed_data).to(device)
 discrim_net = DiscriminatorAIRLCNN(env.n_actions, gamma, env.policy_mask,
                                 env.state_action, path_feature_pad, edge_feature_pad,
                                 path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
                                 path_feature_pad.shape[-1] + edge_feature_pad.shape[-1],
-                                env.pad_idx).to(device)
+                                env.pad_idx, speed_data).to(device)
 
-def calculate_reward_with_varying_features(test_traj, policy_net, discrim_net, env):
+def calculate_reward_with_varying_features(traj_data, time_steps, policy_net, discrim_net, env, transit_dict):
     device = torch.device('cpu')
     policy_net.to(device)
     discrim_net.to(device)
@@ -77,40 +81,44 @@ def calculate_reward_with_varying_features(test_traj, policy_net, discrim_net, e
     reward_data = []
 
     # Only use the first step of the first trajectory
-    episode = test_traj[0]
-    x = episode[-2]
-    print('x',x)
+    traj = traj_data[0]
+    time_step = int(time_steps[0])
+    path = traj.split('_')
     
-    des = torch.LongTensor([episode[-1].next_state]).long().to(device)
-    state = torch.LongTensor([x.cur_state]).to(device)
-    next_state = torch.LongTensor([x.next_state]).to(device)
-    action = torch.LongTensor([x.action]).to(device)
+    des = torch.LongTensor([int(path[-1])]).long().to(device)
+    state = torch.LongTensor([int(path[0])]).to(device)
+    next_state = torch.LongTensor([int(path[1])]).to(device)
+    time_step_tensor = torch.LongTensor([time_step]).to(device)
+    
+    action = transit_dict.get((int(path[0]), int(path[1])), 'N/A')
+    action_tensor = torch.LongTensor([action]).to(device) if action != 'N/A' else None
 
-    # Get the input features
-    neigh_path_feature, neigh_edge_feature, original_path_feature, edge_feature, next_path_feature, next_edge_feature = discrim_net.get_input_features(state, des, action, next_state)
+    if action_tensor is not None:
+        # Get the input features
+        neigh_path_feature, neigh_edge_feature, original_path_feature, edge_feature, next_path_feature, next_edge_feature = discrim_net.get_input_features(state, des, action_tensor, next_state)
 
-    # Get the log probability of the action
-    log_prob = policy_net.get_log_prob(state, des, action)
+        # Get the log probability of the action
+        log_prob = policy_net.get_log_prob(state, des, action_tensor, time_step_tensor).squeeze()
 
-    # Iterate through different values for the second and third elements of path_feature
-    for path_feature_second_value in np.arange(-1.0, 1.1, 0.1):
+        # Iterate through different values for the first and second elements of path_feature
         for path_feature_first_value in np.arange(-1.0, 1.1, 0.1):
-            # Create a new path_feature tensor with the modified second and third values
-            path_feature = original_path_feature.clone()
-            path_feature[0] = path_feature_first_value
-            path_feature[1] = path_feature_second_value
+            for path_feature_second_value in np.arange(-1.0, 1.1, 0.1):
+                # Create a new path_feature tensor with the modified first and second values
+                path_feature = original_path_feature.clone()
+                path_feature[0] = path_feature_first_value
+                path_feature[1] = path_feature_second_value
 
-            # Calculate the reward using the discriminator
-            reward = discrim_net.forward_with_actual_features(
-                neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, 
-                action, log_prob, next_path_feature, next_edge_feature
-            )
+                # Calculate the reward using the discriminator
+                reward = discrim_net.forward_with_actual_features(
+                    neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, 
+                    action_tensor, log_prob, next_path_feature, next_edge_feature, time_step_tensor
+                )
 
-            reward_data.append({
-                'path_feature_second_value': path_feature_first_value,
-                'path_feature_third_value': path_feature_second_value,
-                'reward': reward.item(),
-            })
+                reward_data.append({
+                    'path_feature_first_value': path_feature_first_value,
+                    'path_feature_second_value': path_feature_second_value,
+                    'reward': reward.item(),
+                })
 
     # Convert reward_data to a pandas DataFrame
     reward_df = pd.DataFrame(reward_data)
@@ -120,46 +128,48 @@ def calculate_reward_with_varying_features(test_traj, policy_net, discrim_net, e
 # Load the model
 load_model(model_p)
 
-# Get the first trajectory
-test_trajs = env.import_demonstrations_step(test_p)
+# Read the trajectory data from the CSV file
+trajectory_data = []
+with open('trajectory_with_timestep.csv', 'r') as csvfile:
+    csv_reader = csv.reader(csvfile)
+    next(csv_reader)  # Skip the header row
+    for row in csv_reader:
+        trajectory_data.append(row)
 
-# Calculate rewards for varying path_feature second and third values
-reward_df = calculate_reward_with_varying_features(test_trajs, policy_net, discrim_net, env)
+# Extract test trajectories and their timesteps
+test_traj = [row[0] for row in trajectory_data]
+test_time_steps = [row[1] for row in trajectory_data]
 
-# Create heatmaps
-fig = make_subplots(rows=5, cols=4, shared_xaxes=True, shared_yaxes=True, 
-                    vertical_spacing=0.03, horizontal_spacing=0.03, 
-                    subplot_titles=[f"Heatmap {i+1}" for i in range(20)])
+# Read the transit data from the CSV file
+transit_data = pd.read_csv('../data/transit.csv')
 
-# Reshape the data for heatmaps
-df_pivot = reward_df.pivot(index='path_feature_second_value', columns='path_feature_third_value', values='reward')
+# Create a dictionary to map (link_id, next_link_id) to action
+transit_dict = {}
+for _, row in transit_data.iterrows():
+    transit_dict[(row['link_id'], row['next_link_id'])] = row['action']
 
-# Create 20 heatmaps
-for i in range(20):
-    row = i // 4 + 1
-    col = i % 4 + 1
-    
-    fig.add_trace(
-        go.Heatmap(z=df_pivot.values, x=df_pivot.columns, y=df_pivot.index, 
-                   colorscale='Inferno', zmin=reward_df['reward'].min(), zmax=reward_df['reward'].max()),
-        row=row, col=col
-    )
+# Calculate rewards for varying path_feature first and second values
+reward_df = calculate_reward_with_varying_features(test_traj, test_time_steps, policy_net, discrim_net, env, transit_dict)
+
+# Create heatmap
+fig = go.Figure(data=go.Heatmap(
+    z=-reward_df['reward'].values.reshape(21, 21),
+    x=np.arange(-1.0, 1.1, 0.1),
+    y=np.arange(-1.0, 1.1, 0.1),
+    colorscale='Inferno'
+))
 
 fig.update_layout(
-    title_text="Reward Heatmaps for Varying Path Feature Values",
-    height=1000,
-    width=1000,
-    margin=dict(t=200, r=200, b=200, l=200),
+    title="Reward Heatmap for Varying Path Feature Values",
+    xaxis_title="First Path Feature Value",
+    yaxis_title="Second Path Feature Value",
+    width=800,
+    height=800,
 )
-
-# Update x and y axis labels
-for i in range(20):
-    fig.update_xaxes(title_text="distance", row=(i//4)+1, col=(i%4)+1)
-    fig.update_yaxes(title_text="#link", row=(i//4)+1, col=(i%4)+1)
 
 # Show the plot
 fig.show()
 
 # Optionally, save to HTML
-fig.write_html("./output/reward_heatmaps.html")
-print("Saved heatmaps to ./output/reward_heatmaps.html")
+fig.write_html("./output/reward_heatmap.html")
+print("Saved heatmap to ./output/reward_heatmap.html")
