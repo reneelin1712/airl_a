@@ -72,6 +72,8 @@ class PolicyCNN(nn.Module):
         # neigh_feature = torch.cat([neigh_path_feature, neigh_edge_feature, neigh_mask_feature], -1)
         neigh_feature = neigh_feature[:, self.new_index, :]
         # print('neigh_feature',neigh_feature)
+        
+        # print('block',block)
         x = neigh_feature.view(state.size(0), 3, 3, -1)
        
         x = x.permute(0, 3, 1, 2)

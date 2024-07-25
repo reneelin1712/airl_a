@@ -11,6 +11,7 @@ from model.policy import PolicyCNN
 from model.value import ValueCNN
 from model.discriminator import DiscriminatorAIRLCNN
 
+import csv
 import shap
 
 def load_model(model_path):
@@ -34,15 +35,9 @@ test_p = "../data/cross_validation/test_CV%d.csv" % cv
 edge_p = "../data/edge.txt"
 network_p = "../data/transit.npy"
 path_feature_p = "../data/feature_od.npy"
-# train_p = "../data/cross_validation/train_CV%d_size%d.csv" % (cv, size)
-# test_p = "../data/cross_validation/test_CV%d.csv" % cv
-# # test_p = "../data/cross_validation/train_CV%d_size%d.csv" % (cv, size)
-# model_p = "../trained_models/airl_CV%d_size%d.pt" % (cv, size)
-
-train_p = "../data/shortest/shortest_paths.csv"
-test_p = "../data/shortest/shortest_paths.csv"
-# test_p = "../data/cross_validation/train_CV%d_size%d.csv" % (cv, size)
-model_p = "../trained_models/shortest/shortest.pt"
+train_p = "../data/cross_validation/train_CV%d_size%d.csv" % (cv, size)
+test_p = "../data/cross_validation/test_CV%d.csv" % cv
+model_p = "../trained_models/airl_CV%d_size%d.pt" % (cv, size)
 
 """initialize road environment"""
 od_list, od_dist = ini_od_dist(train_p)
@@ -58,91 +53,158 @@ edge_feature_pad = np.zeros((env.n_states, edge_feature.shape[1]))
 edge_feature_pad[:edge_feature.shape[0], :] = edge_feature
 
 """define actor and critic"""
+edge_data = pd.read_csv('../data/updated_edges.txt')
+speed_data = {(row['n_id'], row['time_step']): row['speed'] for _, row in edge_data.iterrows()}
+
 policy_net = PolicyCNN(env.n_actions, env.policy_mask, env.state_action,
                     path_feature_pad, edge_feature_pad,
                     path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
-                    env.pad_idx).to(device)
+                    env.pad_idx, speed_data).to(device)
 value_net = ValueCNN(path_feature_pad, edge_feature_pad,
-                    path_feature_pad.shape[-1] + edge_feature_pad.shape[-1]).to(device)
+                    path_feature_pad.shape[-1] + edge_feature_pad.shape[-1], speed_data=speed_data).to(device)
 discrim_net = DiscriminatorAIRLCNN(env.n_actions, gamma, env.policy_mask,
                                 env.state_action, path_feature_pad, edge_feature_pad,
                                 path_feature_pad.shape[-1] + edge_feature_pad.shape[-1] + 1,
                                 path_feature_pad.shape[-1] + edge_feature_pad.shape[-1],
-                                env.pad_idx).to(device)
+                                env.pad_idx, speed_data).to(device)
 
-def evaluate_rewards(test_traj, policy_net, discrim_net, env):
+# Read the transit data from the CSV file
+transit_data = pd.read_csv('../data/transit.csv')
+
+# Create a dictionary to map (link_id, next_link_id) to action
+transit_dict = {}
+for _, row in transit_data.iterrows():
+    transit_dict[(row['link_id'], row['next_link_id'])] = row['action']
+
+def evaluate_rewards(traj_data, time_steps, policy_net, discrim_net, env, transit_dict, transit_data):
     device = torch.device('cpu')  # Use CPU device
-    policy_net.to(device)  # Move policy_net to CPU
-    discrim_net.to(device)  # Move discrim_net to CPU
-
+    policy_net.to(device)
+    discrim_net.to(device)
+    
     reward_data = []
     input_features = []
-
-    for episode_idx, episode in enumerate(test_traj):
-        des = torch.LongTensor([episode[-1].next_state]).long().to(device)
-        for step_idx, x in enumerate(episode):
-            state = torch.LongTensor([x.cur_state]).to(device)
-            next_state = torch.LongTensor([x.next_state]).to(device)
-            action = torch.LongTensor([x.action]).to(device)
+    output_rewards = []
+    
+    for episode_idx, (traj, time_step) in enumerate(zip(traj_data, time_steps)):
+        path = traj.split('_')
+        time_step = int(time_step)
+        
+        des = torch.LongTensor([int(path[-1])]).long().to(device)
+        
+        for step_idx in range(len(path) - 1):
+            state = torch.LongTensor([int(path[step_idx])]).to(device)
+            next_state = torch.LongTensor([int(path[step_idx + 1])]).to(device)
+            time_step_tensor = torch.LongTensor([time_step]).to(device)
             
-            # Get the input features
-            neigh_path_feature, neigh_edge_feature, path_feature, edge_feature,next_path_feature, next_edge_feature  = discrim_net.get_input_features(state, des, action, next_state)
+            action = transit_dict.get((int(path[step_idx]), int(path[step_idx + 1])), 'N/A')
+            action_tensor = torch.LongTensor([action]).to(device) if action != 'N/A' else None
             
-            # Get the log probability of the action
-            log_prob = policy_net.get_log_prob(state, des, action)
+            if action_tensor is not None:
+                with torch.no_grad():
+                    neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, next_path_feature, next_edge_feature = discrim_net.get_input_features(state, des, action_tensor, next_state)
+                    log_prob = policy_net.get_log_prob(state, des, action_tensor, time_step_tensor).squeeze()
+                    reward = discrim_net.forward_with_actual_features(neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, action_tensor, log_prob, next_path_feature, next_edge_feature, time_step_tensor)
+                    
+                    # Get speed feature
+                    speed_feature = policy_net.process_features(state, des, time_step_tensor)
+                    
+                    # Collect input features
+                    input_feature = {
+                        'speed_feature': speed_feature.squeeze().cpu().numpy().flatten().tolist(),
+                        'neigh_path_feature': neigh_path_feature.cpu().numpy().flatten().tolist(),
+                        'neigh_edge_feature': neigh_edge_feature.cpu().numpy().flatten().tolist(),
+                        'path_feature': path_feature.cpu().numpy().flatten().tolist(),
+                        'edge_feature': edge_feature.cpu().numpy().flatten().tolist(),
+                        'next_path_feature': next_path_feature.cpu().numpy().flatten().tolist(),
+                        'next_edge_feature': next_edge_feature.cpu().numpy().flatten().tolist(),
+                        'action': action_tensor.item(),
+                        'log_prob': log_prob.item(),
+                        'time_step': time_step
+                    }
+                    input_features.append(input_feature)
+                    output_rewards.append(reward.item())
+            else:
+                reward = torch.tensor('N/A')
             
-            # Calculate the reward using the discriminator
-            reward = discrim_net.forward_with_actual_features(neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, action, log_prob,next_path_feature, next_edge_feature)
+            # Find all possible actions and next states for the current state
+            possible_actions = transit_data[(transit_data['link_id'] == int(path[step_idx]))]['action'].tolist()
+            possible_next_states = transit_data[(transit_data['link_id'] == int(path[step_idx]))]['next_link_id'].tolist()
+            
+            # Calculate the reward for each possible action
+            possible_rewards = []
+            for possible_action, possible_next_state in zip(possible_actions, possible_next_states):
+                possible_action_tensor = torch.LongTensor([possible_action]).to(device)
+                possible_next_state_tensor = torch.LongTensor([possible_next_state]).to(device)
+                
+                with torch.no_grad():
+                    neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, next_path_feature, next_edge_feature = discrim_net.get_input_features(state, des, possible_action_tensor, possible_next_state_tensor)
+                    possible_log_prob = policy_net.get_log_prob(state, des, possible_action_tensor, time_step_tensor).squeeze()
+                    possible_reward = discrim_net.forward_with_actual_features(neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, possible_action_tensor, possible_log_prob, next_path_feature, next_edge_feature, time_step_tensor)
+                
+                possible_rewards.append(possible_reward.item())
             
             reward_data.append({
                 'episode': episode_idx,
+                'des': des.item(),
                 'step': step_idx,
-                'state': x.cur_state,
-                'action': x.action,
-                'next_state': x.next_state,
-                'reward': reward.item()
+                'state': path[step_idx],
+                'action': action,
+                'next_state': path[step_idx + 1],
+                'reward': reward.item() if reward != 'N/A' else 'N/A',
+                'time_step': time_step,
+                'neigh_path_feature': neigh_path_feature.cpu().numpy().flatten().tolist() if action_tensor is not None else [],
+                'neigh_edge_feature': neigh_edge_feature.cpu().numpy().flatten().tolist() if action_tensor is not None else [],
+                'path_feature': path_feature.cpu().numpy().flatten().tolist() if action_tensor is not None else [],
+                'edge_feature': edge_feature.cpu().numpy().flatten().tolist() if action_tensor is not None else [],
+                'next_path_feature': next_path_feature.cpu().numpy().flatten().tolist() if action_tensor is not None else [],
+                'next_edge_feature': next_edge_feature.cpu().numpy().flatten().tolist() if action_tensor is not None else [],
+                'log_prob': log_prob.item() if action_tensor is not None else 'N/A',
+                'speed_feature': speed_feature.squeeze().cpu().numpy().flatten().tolist() if action_tensor is not None else []
             })
             
-            # # Store the input features for SHAP analysis
-            # input_features.append((neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, action,log_prob,next_path_feature, next_edge_feature))
-                      # Flatten the input features before appending
-            # input_features.append((
-            #     neigh_path_feature.detach().cpu().numpy().flatten(),
-            #     neigh_edge_feature.detach().cpu().numpy().flatten(),
-            #     path_feature.detach().cpu().numpy().flatten(),
-            #     edge_feature.detach().cpu().numpy().flatten(),
-            #     action.detach().cpu().numpy().flatten(),
-            #     log_prob.detach().cpu().numpy().flatten(),
-            #     next_path_feature.detach().cpu().numpy().flatten(),
-            #     next_edge_feature.detach().cpu().numpy().flatten()
-            # ))
-            input_features.append(np.concatenate((
-                neigh_path_feature.detach().cpu().numpy().flatten(),
-                neigh_edge_feature.detach().cpu().numpy().flatten(),
-                path_feature.detach().cpu().numpy().flatten(),
-                edge_feature.detach().cpu().numpy().flatten(),
-                action.detach().cpu().numpy().flatten(),
-                log_prob.detach().cpu().numpy().flatten(),
-                next_path_feature.detach().cpu().numpy().flatten(),
-                next_edge_feature.detach().cpu().numpy().flatten()
-            )))
+            for possible_action, possible_next_state, possible_reward in zip(possible_actions, possible_next_states, possible_rewards):
+                reward_data.append({
+                    'episode': episode_idx,
+                    'des': des.item(),
+                    'step': step_idx,
+                    'state': path[step_idx],
+                    'action': possible_action,
+                    'next_state': possible_next_state,
+                    'reward': possible_reward,
+                    'time_step': time_step
+                })
+    
     # Convert reward_data to a pandas DataFrame
     reward_df = pd.DataFrame(reward_data)
+    
+    return reward_df, input_features, output_rewards
 
-    return input_features, reward_df
+import numpy as np
 
 def create_shap_explainer(model, input_features):
-    def predict_fn(input_features):
-        # # Reverse the original dimensions for each input feature
-        # neigh_path_feature = torch.tensor(input_features[:, 0].reshape(-1, 4, 12), dtype=torch.float32)
-        # neigh_edge_feature = torch.tensor(input_features[:, 1].reshape(-1, 5, 7), dtype=torch.float32)
-        # path_feature = torch.tensor(input_features[:, 2].reshape(-1, 12), dtype=torch.float32)
-        # edge_feature = torch.tensor(input_features[:, 3].reshape(-1, 5), dtype=torch.float32)
-        # action = torch.tensor(input_features[:, 4], dtype=torch.long)
-        # log_prob = torch.tensor(input_features[:, 5], dtype=torch.float32)
-        # next_path_feature = torch.tensor(input_features[:, 6].reshape(-1, 12), dtype=torch.float32)
-        # next_edge_feature = torch.tensor(input_features[:, 7].reshape(-1, 5), dtype=torch.float32)
+    # Convert input_features from list of dictionaries to a 2D numpy array
+    feature_keys = ['speed_feature', 'neigh_path_feature', 'neigh_edge_feature', 'path_feature', 'edge_feature', 'next_path_feature', 'next_edge_feature', 'action', 'log_prob', 'time_step']
+    
+    # Initialize an empty list to store flattened features
+    flattened_features = []
+    
+    for feature_dict in input_features:
+        # Flatten and concatenate all features for each sample
+        sample_features = []
+        for key in feature_keys:
+            if key in feature_dict:
+                if isinstance(feature_dict[key], (int, float)):
+                    sample_features.append(feature_dict[key])
+                else:
+                    sample_features.extend(np.array(feature_dict[key]).flatten())
+            else:
+                print(f"Warning: {key} not found in feature dictionary")
+        flattened_features.append(sample_features)
+    
+    # Convert to numpy array
+    input_features_array = np.array(flattened_features)
 
+    def predict_fn(input_features):
         # Determine the number of samples
         num_samples = input_features.shape[0]
 
@@ -152,14 +214,19 @@ def create_shap_explainer(model, input_features):
         # Iterate over the samples
         for i in range(num_samples):
             # Extract the features for the current sample
-            neigh_path_feature = torch.tensor(input_features[i, :48].reshape(4, 12), dtype=torch.float32)
-            neigh_edge_feature = torch.tensor(input_features[i, 48:76].reshape(4, 7), dtype=torch.float32)
-            path_feature = torch.tensor(input_features[i, 76:88], dtype=torch.float32)
-            edge_feature = torch.tensor(input_features[i, 88:95], dtype=torch.float32)
-            action = torch.tensor(input_features[i, 95], dtype=torch.long)
-            log_prob = torch.tensor(input_features[i, 96], dtype=torch.float32)
-            next_path_feature = torch.tensor(input_features[i, 97:109], dtype=torch.float32)
-            next_edge_feature = torch.tensor(input_features[i, 109:116], dtype=torch.float32)
+            neigh_path_feature = torch.tensor(input_features[i, :108].reshape(9, 12), dtype=torch.float32)
+            neigh_edge_feature = torch.tensor(input_features[i, 108:171].reshape(9, 7), dtype=torch.float32)
+            speed_feature = torch.tensor(input_features[i, 171:180].reshape(9, 1), dtype=torch.float32)
+            path_feature = torch.tensor(input_features[i, 180:192], dtype=torch.float32)
+            edge_feature = torch.tensor(input_features[i, 192:199], dtype=torch.float32)
+            action = torch.tensor(input_features[i, 199], dtype=torch.long)
+            log_prob = torch.tensor(input_features[i, 200], dtype=torch.float32)
+            next_path_feature = torch.tensor(input_features[i, 201:213], dtype=torch.float32)
+            next_edge_feature = torch.tensor(input_features[i, 213:220], dtype=torch.float32)
+            time_step = torch.tensor(input_features[i, 220], dtype=torch.long)
+
+            # Ensure action is non-negative and within the valid range
+            action = torch.clamp(action, min=0, max=model.action_num - 1)
 
             # Calculate the model output for the current sample
             model_output = model.forward_with_actual_features(
@@ -170,108 +237,22 @@ def create_shap_explainer(model, input_features):
                 action.unsqueeze(0),
                 log_prob.unsqueeze(0),
                 next_path_feature.unsqueeze(0),
-                next_edge_feature.unsqueeze(0)
+                next_edge_feature.unsqueeze(0),
+                time_step.unsqueeze(0)
             ).detach().numpy()
 
             # Store the model output for the current sample
             model_outputs[i] = model_output
 
         return model_outputs
-        
-        # neigh_path_feature = torch.tensor(input_features[:, 0], dtype=torch.float32)
-        # neigh_edge_feature = torch.tensor(input_features[:, 1], dtype=torch.float32)
-        # path_feature = torch.tensor(input_features[:, 2], dtype=torch.float32)
-        # edge_feature = torch.tensor(input_features[:, 3], dtype=torch.float32)
-        # action = torch.tensor(input_features[:, 4], dtype=torch.long)
-        # log_prob = torch.tensor(input_features[:, 5], dtype=torch.float32)
-        # next_path_feature = torch.tensor(input_features[:, 6], dtype=torch.float32)
-        # next_edge_feature = torch.tensor(input_features[:, 7], dtype=torch.float32)
-        # return model.forward_with_actual_features(neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, action, log_prob,next_path_feature, next_edge_feature).detach().numpy()
 
-    # # Extract individual components from input_features
-    # neigh_path_feature, neigh_edge_feature, path_feature, edge_feature, action, log_prob,next_path_feature, next_edge_feature = zip(*input_features)
-
-    # # Convert each component to a numpy array
-    # neigh_path_feature_array = np.array([npf.detach().cpu().numpy() for npf in neigh_path_feature])
-    # neigh_edge_feature_array = np.array([nef.detach().cpu().numpy() for nef in neigh_edge_feature])
-    # path_feature_array = np.array([pf.detach().cpu().numpy() for pf in path_feature])
-    # edge_feature_array = np.array([ef.detach().cpu().numpy() for ef in edge_feature])
-    # action_array = np.array([a.detach().cpu().numpy() for a in action])
-    # log_prob_array = np.array([lp.detach().cpu().numpy() for lp in log_prob])
-    # next_path_feature_array = np.array([npf.detach().cpu().numpy() for npf in next_path_feature])
-    # next_edge_feature_array = np.array([nef.detach().cpu().numpy() for nef in next_edge_feature])
-
-    # # Stack the arrays along a new axis to create the background data
-    # background_data = np.stack((neigh_path_feature_array,
-    #                             neigh_edge_feature_array,
-    #                             path_feature_array,
-    #                             edge_feature_array,
-    #                             action_array,
-    #                             log_prob_array,
-    #                             next_path_feature_array,
-    #                             next_edge_feature_array), axis=1)
-    # # # Create a background dataset by selecting a subset of input features
-    # # background_size = min(100, len(input_features))
-    # # background_data = shap.sample(combined_array, background_size)
-    # Stack the input features along a new axis to create the background data
-    input_features_array = np.array(input_features)
     # Create the background dataset
     background_data = shap.sample(input_features_array, 10) 
 
     explainer = shap.KernelExplainer(predict_fn, background_data)
-    return explainer
+    return explainer, input_features_array
 
-# def analyze_shap_values(explainer, input_features):
-#     input_features_array = np.array(input_features)
 
-#     # Create a mapping between feature indices and their corresponding names
-#     feature_mapping = {
-#         'shortest_distance': [76],
-#         'number_of_links': [77],
-#         'number_of_left_turn': [78],
-#         'number_of_right_turn': [79],
-#         'number_of_u_turn': [80],
-#         'freq_road_type_1': [81],
-#         'freq_road_type_2': [82],
-#         'freq_road_type_3': [83],
-#         'freq_road_type_4': [84],
-#         'freq_road_type_5': [85],
-#         'freq_road_type_6': [86],
-#     }
-
-#     # Create a list of real feature names
-#     real_feature_names = list(feature_mapping.keys())
-
-#     # Select the desired features from the input features array
-#     selected_features_indices = [index for indices in feature_mapping.values() for index in indices]
-#     print('selected_features_indices',selected_features_indices)
-#     selected_features = input_features_array[:, selected_features_indices]
-#     print('selected_features',selected_features)
-
-#     # Calculate SHAP values for the selected features
-#     shap_values_selected = explainer.shap_values(selected_features)
-#     print('shap_values_selected',shap_values_selected)
-#     shap_values_selected_squeezed = np.squeeze(shap_values_selected)
-
-#     # Initialize a DataFrame to store the SHAP values for each feature
-#     shap_values_df = pd.DataFrame(columns=real_feature_names)
-
-#     # Assign the SHAP values to the corresponding features
-#     for feature_name, indices in feature_mapping.items():
-#         feature_indices = [selected_features_indices.index(index) for index in indices]
-#         shap_values_df[feature_name] = np.sum(shap_values_selected_squeezed[:, feature_indices], axis=1)
-
-#     # Save the SHAP values to a CSV file
-#     shap_values_df.to_csv('shap_values_selected.csv', index=False)
-
-#     # Print the path to the saved file for confirmation
-#     print("SHAP values for selected features saved to 'shap_values_selected.csv'")
-
-#     # Reshape the SHAP values to match the expected format for summary_plot
-#     shap_values_reshaped = shap_values_df.values.reshape(len(real_feature_names), -1)
-
-#     # Plot the SHAP summary plot with real feature names
-#     shap.summary_plot(shap_values_reshaped, plot_type="bar", feature_names=real_feature_names)
 import matplotlib.pyplot as plt
 
 def analyze_shap_values(explainer, input_features, feature_indices):
@@ -285,10 +266,37 @@ def analyze_shap_values(explainer, input_features, feature_indices):
     # Subset the SHAP values to only analyze selected features
     selected_shap_values = shap_values_squeezed[:, feature_indices]
 
-    # Create feature names for the selected columns
-    # selected_feature_names = ['Feature ' + str(i) for i in feature_indices]
-        # Map selected feature indices to their names
-    selected_feature_names = [feature_names_dict[index] for index in feature_indices]
+    # Map selected feature indices to their names
+    feature_names_dict = {
+        171: 'speed_neighbor_1',
+        172: 'speed_neighbor_2',
+        173: 'speed_neighbor_3',
+        174: 'speed_neighbor_4',
+        175: 'speed_neighbor_5',
+        176: 'speed_neighbor_6',
+        177: 'speed_neighbor_7',
+        178: 'speed_neighbor_8',
+        179: 'speed_neighbor_9',
+        180: 'shortest_distance',
+        181: 'number_of_links',
+        182: 'number_of_left_turn',
+        183: 'number_of_right_turn',
+        184: 'number_of_u_turn',
+        185: 'freq_road_type_1',
+        186: 'freq_road_type_2',
+        187: 'freq_road_type_3',
+        188: 'freq_road_type_4',
+        189: 'freq_road_type_5',
+        190: 'freq_road_type_6',
+        192: 'link_length',
+        193: 'road_type_1',
+        194: 'road_type_2',
+        195: 'road_type_3',
+        196: 'road_type_4',
+        197: 'road_type_5',
+        198: 'road_type_6',
+    }
+    selected_feature_names = [feature_names_dict.get(index, f'Feature {index}') for index in feature_indices]
 
     # Convert selected SHAP values to a DataFrame
     selected_shap_values_df = pd.DataFrame(selected_shap_values, columns=selected_feature_names)
@@ -304,107 +312,36 @@ def analyze_shap_values(explainer, input_features, feature_indices):
     plt.close()
     print("Selected SHAP summary plot saved to 'selected_shap_summary_plot.png'")
 
-    # # Create feature names for the columns
-    # feature_names = ['Feature ' + str(i) for i in range(shap_values_squeezed.shape[1])]
-
-    # # Convert SHAP values to a DataFrame
-    # shap_values_df = pd.DataFrame(shap_values_squeezed, columns=feature_names)
-
-    # # Save the DataFrame to a CSV file
-    # shap_values_df.to_csv('shap_values.csv', index=False)
-
-    # # Print the path to the saved file for confirmation
-    # print("SHAP values saved to 'shap_values.csv'")
-
-    # # Plot the SHAP summary plot with feature names
-    # shap.summary_plot(shap_values_squeezed, input_features_array, plot_type="bar", feature_names=feature_names, show=False)
-    # # Save the plot as an image file
-    # plt.savefig('shap_summary_plot.png')
-    # plt.close()
-
-    # Notify user of plot save
-    print("SHAP summary plot saved to 'shap_summary_plot.png'")
-
-
-
 
 """Evaluate rewards"""
-test_trajs = env.import_demonstrations_step(test_p)
-input_features, reward_df = evaluate_rewards(test_trajs, policy_net, discrim_net, env)
+
+# Read the trajectory data from the CSV file
+trajectory_data = []
+with open('trajectory_with_timestep.csv', 'r') as csvfile:
+    csv_reader = csv.reader(csvfile)
+    next(csv_reader)  # Skip the header row
+    for row in csv_reader:
+        trajectory_data.append(row)
+
+# Extract test and learner trajectories and their timesteps
+test_traj = [row[0] for row in trajectory_data]
+test_time_steps = [row[1] for row in trajectory_data]
+learner_traj = [row[2] for row in trajectory_data]
+learner_time_steps = [row[3] for row in trajectory_data]
+
+reward_df, input_features, output_rewards = evaluate_rewards(test_traj, test_time_steps, policy_net, discrim_net, env, transit_dict, transit_data)
 # print('input_features', input_features)
 
+
 """Create SHAP explainer"""
-explainer = create_shap_explainer(discrim_net, input_features)
+# In the main part of your script:
+explainer, input_features_array = create_shap_explainer(discrim_net, input_features)
 
-"""Analyze SHAP values"""
-feature_names_dict = {
-    76: 'shortest_distance',
-    77: 'number_of_links',
-    78: 'number_of_left_turn',
-    79: 'number_of_right_turn',
-    80: 'number_of_u_turn',
-    81: 'freq_road_type_1',
-    82: 'freq_road_type_2',
-    83: 'freq_road_type_3',
-    84: 'freq_road_type_4',
-    85: 'freq_road_type_5',
-    86: 'freq_road_type_6',
-    # 88: 'link_length',
-    # 89: 'road_type_1',
-    # 90: 'road_type_2',
-    # 91: 'road_type_3',
-    # 92: 'road_type_4',
-    # 93: 'road_type_5',
-    # 94: 'road_type_6',
-}
-
-selected_feature_indices = [76,77,78,79,80,81,82,83,84,85,86,] #88,89,90,91,92,93,94
-analyze_shap_values(explainer, input_features[0:20],selected_feature_indices )
-
-
-
-# def analyze_shap_values(explainer, input_features):
-#     input_features_array = np.array(input_features)
-
-#     # Create a mapping between feature indices and their corresponding names
-#     feature_mapping = {
-#         'shortest_distance': [76],
-#         'number_of_links': [77],
-#         'number_of_left_turn': [78],
-#         'number_of_right_turn': [79],
-#         'number_of_u_turn': [80],
-#         'freq_road_type_1': [81],
-#         'freq_road_type_2': [82],
-#         'freq_road_type_3': [83],
-#         'freq_road_type_4': [84],
-#         'freq_road_type_5': [85],
-#         'freq_road_type_6': [86],
-#     }
-
-#     # Create a list of real feature names
-#     real_feature_names = list(feature_mapping.keys())
-
-#     # Select the desired features from the input features array
-#     selected_features_indices = [index for indices in feature_mapping.values() for index in indices]
-#     selected_features = input_features_array[:, selected_features_indices]
-
-#     # Calculate SHAP values for the selected features
-#     shap_values_selected = explainer.shap_values(selected_features)
-#     shap_values_selected_squeezed = np.squeeze(shap_values_selected)
-
-#     # Initialize a DataFrame to store the SHAP values for each feature
-#     shap_values_df = pd.DataFrame(columns=real_feature_names)
-
-#     # Assign the SHAP values to the corresponding features
-#     for feature_name, indices in feature_mapping.items():
-#         feature_indices = [selected_features_indices.index(index) for index in indices]
-#         shap_values_df[feature_name] = np.sum(shap_values_selected_squeezed[:, feature_indices], axis=1)
-
-#     # Save the SHAP values to a CSV file
-#     shap_values_df.to_csv('shap_values_selected.csv', index=False)
-
-#     # Print the path to the saved file for confirmation
-#     print("SHAP values for selected features saved to 'shap_values_selected.csv'")
-
-#     # Plot the SHAP summary plot with real feature names
-#     shap.summary_plot(shap_values_df.values, plot_type="bar", feature_names=real_feature_names)
+# Example usage:
+selected_feature_indices = [
+    171, 172, 173, 174, 175, 176, 177, 178, 179,  # Speed features
+    180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190,  # Path features
+    192, 193, 194, 195, 196, 197, 198  # Edge features
+]
+# Update the analyze_shap_values function call
+analyze_shap_values(explainer, input_features_array[0:10], selected_feature_indices)
